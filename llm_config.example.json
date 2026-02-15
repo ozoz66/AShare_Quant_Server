@@ -1,6 +1,0 @@
-{
-  "llm_url": "https://api.example.com/v1",
-  "llm_api_key": "sk-your-api-key-here",
-  "llm_model": "your-model-name",
-  "timeout": 120
-}

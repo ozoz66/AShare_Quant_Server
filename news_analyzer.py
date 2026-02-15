@@ -5,20 +5,15 @@ News & sentiment analysis module.
 
 Provides:
   - Multi-source news data fetching (news, announcements, research reports)
-  - LLM-based sentiment analysis (single stock & batch)
-  - Graceful fallback when LLM is unavailable
+  - Rule-based sentiment analysis (no LLM dependency)
+  - Raw data output for external LLM agents (e.g., OpenClaw) to analyze
 """
 
 from __future__ import annotations
 
-import json
-import re
-import sys
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 
 import akshare as ak
-import pandas as pd
 
 from indicators import to_float, pick_col
 
@@ -141,11 +136,37 @@ def fetch_stock_comment(symbol: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# LLM Sentiment Analysis
+# Rule-Based Sentiment Analysis (no LLM required)
 # ---------------------------------------------------------------------------
 
+# Positive keywords in news/announcement titles
+_POSITIVE_KEYWORDS = [
+    "利好", "大涨", "涨停", "突破", "创新高", "超预期", "业绩增长", "净利润增",
+    "营收增", "分红", "回购", "增持", "战略合作", "中标", "获批", "订单",
+    "签约", "扩产", "产能", "新产品", "专利", "技术突破", "行业龙头",
+    "景气", "复苏", "放量", "资金流入", "北向资金", "机构加仓",
+]
+
+_NEGATIVE_KEYWORDS = [
+    "利空", "大跌", "跌停", "暴跌", "亏损", "下滑", "下降", "减持",
+    "质押", "违规", "处罚", "诉讼", "风险", "警示", "ST", "*ST",
+    "退市", "业绩下滑", "净利润降", "营收降", "商誉减值", "计提",
+    "资金流出", "股东减持", "高管辞职", "立案调查", "监管",
+]
+
+# Analyst rating mapping to score delta
+_RATING_SCORES = {
+    "买入": 2.0, "强烈推荐": 2.0, "强推": 2.0,
+    "增持": 1.5, "推荐": 1.5, "优于大市": 1.5,
+    "审慎增持": 1.0, "谨慎增持": 1.0,
+    "中性": 0.0, "持有": 0.0, "同步大市": 0.0,
+    "减持": -1.5, "卖出": -2.0, "回避": -2.0,
+    "弱于大市": -1.5, "不推荐": -2.0,
+}
+
+
 def default_sentiment() -> dict:
-    """Return neutral sentiment (used when LLM is unavailable or data is empty)."""
+    """Return neutral sentiment (used when data is insufficient)."""
     return {
         "score": 5,
         "label": "中性",
@@ -155,264 +176,132 @@ def default_sentiment() -> dict:
     }
 
 
-def _build_sentiment_prompt(
-    news: list[dict],
-    notices: list[dict] | None = None,
-    reports: list[dict] | None = None,
-) -> str:
-    """Build the user prompt for single-stock sentiment analysis."""
-    sections = []
-
-    if news:
-        lines = []
-        for i, item in enumerate(news[:8], 1):
-            t = item.get("time", "")
-            lines.append(f"{i}. {item['title']} ({t})")
-        sections.append("【近期新闻】\n" + "\n".join(lines))
-
-    if notices:
-        lines = []
-        for i, item in enumerate(notices[:5], 1):
-            t = item.get("time", "")
-            lines.append(f"{i}. {item['title']} ({t})")
-        sections.append("【公司公告】\n" + "\n".join(lines))
-
-    if reports:
-        lines = []
-        for i, item in enumerate(reports[:5], 1):
-            src = item.get("source", "")
-            rating = item.get("rating", "")
-            tp = item.get("target_price")
-            tp_str = f" 目标价{tp}" if tp else ""
-            lines.append(f"{i}. {src}: {rating}{tp_str} ({item.get('time', '')})")
-        sections.append("【机构评级】\n" + "\n".join(lines))
-
-    if not sections:
-        return ""
-
-    return "\n\n".join(sections)
+def _score_from_keywords(titles: list[str]) -> float:
+    """Score news/notice titles by keyword matching. Returns delta from 0."""
+    if not titles:
+        return 0.0
+    pos_count = 0
+    neg_count = 0
+    for title in titles:
+        for kw in _POSITIVE_KEYWORDS:
+            if kw in title:
+                pos_count += 1
+                break
+        for kw in _NEGATIVE_KEYWORDS:
+            if kw in title:
+                neg_count += 1
+                break
+    total = len(titles)
+    if total == 0:
+        return 0.0
+    # Net sentiment ratio scaled to [-2.5, +2.5]
+    return (pos_count - neg_count) / total * 2.5
 
 
-_SENTIMENT_SYSTEM_PROMPT = (
-    "你是A股消息面分析专家。请分析给定股票的近期消息，给出情绪判断。\n"
-    "请严格以JSON格式输出（不要输出其他内容）：\n"
-    '{"score": <0到10的整数, 5为中性, 越高越利好>, '
-    '"label": "<利好/中性/利空>", '
-    '"key_themes": ["<关键主题>"], '
-    '"risk_flags": ["<风险提示>"], '
-    '"summary": "<一句话总结消息面>"}'
-)
+def _score_from_ratings(reports: list[dict]) -> float:
+    """Score from analyst ratings. Returns delta from 0."""
+    if not reports:
+        return 0.0
+    total_delta = 0.0
+    counted = 0
+    for r in reports:
+        rating = r.get("rating", "").strip()
+        for key, delta in _RATING_SCORES.items():
+            if key in rating:
+                total_delta += delta
+                counted += 1
+                break
+    if counted == 0:
+        return 0.0
+    # Average rating delta, capped to [-2.5, +2.5]
+    avg = total_delta / counted
+    return max(-2.5, min(2.5, avg))
 
 
-def _parse_sentiment_json(text: str) -> dict | None:
-    """Try to parse LLM response as sentiment JSON."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "score" in data:
-            score = int(data["score"])
-            data["score"] = max(0, min(10, score))
-            if "label" not in data:
-                data["label"] = "利好" if score >= 7 else ("利空" if score <= 3 else "中性")
-            if "key_themes" not in data:
-                data["key_themes"] = []
-            if "risk_flags" not in data:
-                data["risk_flags"] = []
-            if "summary" not in data:
-                data["summary"] = ""
-            return data
-    except (json.JSONDecodeError, ValueError, TypeError):
-        pass
-
-    m = re.search(r'"score"\s*:\s*(\d+)', text)
-    if m:
-        score = max(0, min(10, int(m.group(1))))
-        label_m = re.search(r'"label"\s*:\s*"([^"]+)"', text)
-        summary_m = re.search(r'"summary"\s*:\s*"([^"]+)"', text)
-        return {
-            "score": score,
-            "label": label_m.group(1) if label_m else ("利好" if score >= 7 else ("利空" if score <= 3 else "中性")),
-            "key_themes": [],
-            "risk_flags": [],
-            "summary": summary_m.group(1) if summary_m else "",
-        }
-
-    return None
-
-
-def analyze_sentiment(
-    llm_config,
+def analyze_sentiment_rule_based(
     news: list[dict],
     notices: list[dict] | None = None,
     reports: list[dict] | None = None,
 ) -> dict:
     """
-    Analyze sentiment for a single stock using LLM.
+    Rule-based sentiment analysis using keyword matching and analyst ratings.
 
-    Args:
-        llm_config: LLMConfig or None. If None, returns neutral default.
-        news: News items list.
-        notices: Company announcements list.
-        reports: Research report/rating list.
-
-    Returns:
-        Sentiment dict with score (0-10), label, key_themes, risk_flags, summary.
+    Returns sentiment dict with score (0-10), label, key_themes, risk_flags, summary.
+    Base score is 5 (neutral), adjusted by news keywords and analyst ratings.
     """
-    if llm_config is None:
-        return default_sentiment()
+    all_titles = [item.get("title", "") for item in (news or [])]
+    all_titles += [item.get("title", "") for item in (notices or [])]
 
-    content = _build_sentiment_prompt(news, notices, reports)
-    if not content:
-        return default_sentiment()
+    news_delta = _score_from_keywords(all_titles)
+    rating_delta = _score_from_ratings(reports or [])
 
-    from llm_client import chat_completion
+    # Combine: news keywords + analyst ratings
+    # news_delta range: [-2.5, +2.5]
+    # rating_delta range: [-2.5, +2.5]
+    raw_score = 5.0 + news_delta + rating_delta
+    score = max(0, min(10, round(raw_score)))
 
-    try:
-        response = chat_completion(
-            config=llm_config,
-            messages=[
-                {"role": "system", "content": _SENTIMENT_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            temperature=0.1,
-            max_tokens=500,
-        )
-        result = _parse_sentiment_json(response)
-        if result:
-            return result
-        print(f"  [WARN] LLM情感分析返回格式异常，使用中性默认值", file=sys.stderr)
-        return default_sentiment()
-    except Exception as e:
-        print(f"  [WARN] LLM情感分析失败: {e}，使用中性默认值", file=sys.stderr)
-        return default_sentiment()
+    # Extract themes and risks
+    key_themes = []
+    risk_flags = []
+    for title in all_titles:
+        for kw in _POSITIVE_KEYWORDS[:15]:
+            if kw in title:
+                if kw not in key_themes:
+                    key_themes.append(kw)
+                break
+        for kw in _NEGATIVE_KEYWORDS[:15]:
+            if kw in title:
+                if kw not in risk_flags:
+                    risk_flags.append(kw)
+                break
+
+    # Label
+    if score >= 7:
+        label = "利好"
+    elif score <= 3:
+        label = "利空"
+    else:
+        label = "中性"
+
+    # Summary
+    parts = []
+    if reports:
+        ratings = [r.get("rating", "") for r in reports[:3] if r.get("rating")]
+        if ratings:
+            parts.append(f"机构评级: {'/'.join(ratings)}")
+    if key_themes:
+        parts.append(f"利好: {','.join(key_themes[:3])}")
+    if risk_flags:
+        parts.append(f"风险: {','.join(risk_flags[:3])}")
+    summary = "; ".join(parts) if parts else "消息面平淡"
+
+    return {
+        "score": score,
+        "label": label,
+        "key_themes": key_themes[:5],
+        "risk_flags": risk_flags[:5],
+        "summary": summary,
+        "raw_score": round(raw_score, 2),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Batch Sentiment Analysis (for scanner)
-# ---------------------------------------------------------------------------
-
-_BATCH_SYSTEM_PROMPT = (
-    "你是A股消息面分析专家。请对以下多只股票的消息面分别给出情绪评分。\n"
-    "请严格以JSON格式输出（不要输出其他内容），每只股票一个条目：\n"
-    '{"<股票代码>": {"score": <0-10整数>, "label": "<利好/中性/利空>", "summary": "<一句话>"}, ...}'
-)
-
-
-def analyze_sentiment_batch(
-    llm_config,
+def analyze_sentiment_batch_rule_based(
     stocks_data: dict[str, dict],
 ) -> dict[str, dict]:
     """
-    Batch sentiment analysis for multiple stocks in a single LLM call.
+    Batch rule-based sentiment analysis for multiple stocks.
 
     Args:
-        llm_config: LLMConfig or None.
         stocks_data: {code: {"name": str, "news": [...], "notices": [...], "reports": [...]}}
 
     Returns:
         {code: sentiment_result, ...}
     """
-    if llm_config is None or not stocks_data:
-        return {code: default_sentiment() for code in stocks_data}
-
-    sections = []
+    result = {}
     for code, data in stocks_data.items():
-        name = data.get("name", code)
-        header = f"=== {name} ({code}) ==="
         news = data.get("news", [])
         notices = data.get("notices", [])
         reports = data.get("reports", [])
-
-        lines = [header]
-        if news:
-            news_str = "; ".join(item["title"] for item in news[:3])
-            lines.append(f"新闻: {news_str}")
-        if notices:
-            notice_str = "; ".join(item["title"] for item in notices[:2])
-            lines.append(f"公告: {notice_str}")
-        if reports:
-            report_str = "; ".join(
-                f"{item.get('source', '')}:{item.get('rating', '')}" for item in reports[:3]
-            )
-            lines.append(f"评级: {report_str}")
-        if not news and not notices and not reports:
-            lines.append("暂无消息")
-
-        sections.append("\n".join(lines))
-
-    content = "\n\n".join(sections)
-
-    from llm_client import chat_completion
-
-    try:
-        response = chat_completion(
-            config=llm_config,
-            messages=[
-                {"role": "system", "content": _BATCH_SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            temperature=0.1,
-            max_tokens=1500,
-        )
-
-        result = _parse_batch_response(response, list(stocks_data.keys()))
-        return result
-    except Exception as e:
-        print(f"  [WARN] LLM批量情感分析失败: {e}，使用中性默认值", file=sys.stderr)
-        return {code: default_sentiment() for code in stocks_data}
-
-
-def _parse_batch_response(text: str, codes: list[str]) -> dict[str, dict]:
-    """Parse batch sentiment LLM response."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-
-    result = {}
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            for code in codes:
-                entry = data.get(code, {})
-                if isinstance(entry, dict) and "score" in entry:
-                    score = max(0, min(10, int(entry["score"])))
-                    result[code] = {
-                        "score": score,
-                        "label": entry.get("label", "中性"),
-                        "key_themes": entry.get("key_themes", []),
-                        "risk_flags": entry.get("risk_flags", []),
-                        "summary": entry.get("summary", ""),
-                    }
-                else:
-                    result[code] = default_sentiment()
-    except (json.JSONDecodeError, ValueError, TypeError):
-        pass
-
-    for code in codes:
-        if code not in result:
-            result[code] = default_sentiment()
-
+        result[code] = analyze_sentiment_rule_based(news, notices, reports)
     return result
-
-
-# ---------------------------------------------------------------------------
-# LLM Config Helper
-# ---------------------------------------------------------------------------
-
-def try_load_llm_config():
-    """
-    Try to load LLM config without crashing.
-    Returns LLMConfig or None.
-    """
-    try:
-        from llm_client import load_llm_config
-        config_path = Path(__file__).resolve().parent / "llm_config.json"
-        return load_llm_config(config_path=config_path)
-    except Exception:
-        return None

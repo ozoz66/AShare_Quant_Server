@@ -9,14 +9,12 @@ programmatic invocation by LLM agents (e.g., OpenClaw).
 Subcommands:
   scan     - Batch multi-factor stock screening
   analyze  - Single stock deep analysis
-  report   - Combined scanner + analyzer + LLM final report
 
 All subcommands support --json flag for structured JSON output.
 
 Usage:
   python main.py scan --top 10 --json
   python main.py analyze --symbol 600519 --json
-  python main.py report --symbol 600519 --top 10 --json
 """
 
 import argparse
@@ -56,33 +54,6 @@ def cmd_analyze(args):
         print(result)
 
 
-def cmd_report(args):
-    """Execute full pipeline: scan + analyze + LLM summary."""
-    import subprocess
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent
-    script = root / "llm_final_report.py"
-
-    cmd = [sys.executable, str(script)]
-    if args.symbol:
-        cmd.extend(["--symbol", args.symbol])
-    cmd.extend(["--top", str(args.top)])
-    cmd.extend(["--pool", args.pool])
-    cmd.extend(["--output-dir", args.output_dir])
-    if args.json:
-        cmd.append("--json")
-
-    proc = subprocess.run(
-        cmd,
-        capture_output=False,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    sys.exit(proc.returncode)
-
-
 def main():
     parser = argparse.ArgumentParser(
         prog="ashare-quant",
@@ -103,15 +74,6 @@ def main():
     p_analyze.add_argument("--symbol", type=str, required=True, help="Stock code or name (e.g., 600519 or 贵州茅台)")
     p_analyze.add_argument("--json", action="store_true", help="Output JSON format")
     p_analyze.set_defaults(func=cmd_analyze)
-
-    # --- report ---
-    p_report = subparsers.add_parser("report", help="Full pipeline: scan + analyze + LLM summary")
-    p_report.add_argument("--symbol", type=str, default="", help="Stock code (auto-extracted from scan if empty)")
-    p_report.add_argument("--top", type=int, default=10, help="Top N for scanner")
-    p_report.add_argument("--pool", type=str, default="tech_stock_pool.json", help="Stock pool JSON path")
-    p_report.add_argument("--output-dir", type=str, default="output", help="Output directory")
-    p_report.add_argument("--json", action="store_true", help="Output JSON format")
-    p_report.set_defaults(func=cmd_report)
 
     args = parser.parse_args()
     if not args.command:

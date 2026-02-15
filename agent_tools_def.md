@@ -2,13 +2,13 @@
 
 ## Overview / 概述
 
-- English: This document defines the tools available for LLM agents (such as OpenClaw) to interact with the AShare Quant Server. All tools are invoked via CLI commands and return structured output (text or JSON).
-- 中文：本文档定义了 LLM Agent（如 OpenClaw）与 AShare Quant Server 交互的可用工具。所有工具通过 CLI 命令调用，返回结构化输出（文本或 JSON）。
+- English: This document defines the tools available for LLM agents (such as OpenClaw) to interact with the AShare Quant Server. All tools are invoked via CLI commands and return structured output (text or JSON). The server handles data acquisition and quantitative scoring; LLM-based reasoning and report generation should be performed by the calling agent.
+- 中文：本文档定义了 LLM Agent（如 OpenClaw）与 AShare Quant Server 交互的可用工具。所有工具通过 CLI 命令调用，返回结构化输出（文本或 JSON）。服务器负责数据获取和量化评分；LLM 推理和报告生成由调用方 Agent 完成。
 
 ## Important Notes / 重要说明
 
-- English: All tools run **headlessly** on the server. No GUI or browser is needed. Use `--json` flag for machine-readable output.
-- 中文：所有工具在服务器上**无头运行**，无需 GUI 或浏览器。使用 `--json` 标志获取机器可读输出。
+- English: All tools run **headlessly** on the server. No GUI or browser is needed. Use `--json` flag for machine-readable output. No LLM API configuration is needed on the server side — sentiment analysis uses rule-based scoring.
+- 中文：所有工具在服务器上**无头运行**，无需 GUI 或浏览器。使用 `--json` 标志获取机器可读输出。服务端无需配置 LLM API — 消息面分析使用规则化评分。
 
 ---
 
@@ -16,8 +16,8 @@
 
 ### Basics / 基本信息
 
-- English: Scans a stock pool in batch and ranks candidates with fundamentals + technicals + sentiment (LLM).
-- 中文：批量扫描股票池，执行基本面 + 技术面 + 消息面（LLM）评分并排序。
+- English: Scans a stock pool in batch and ranks candidates with fundamentals + technicals + rule-based sentiment.
+- 中文：批量扫描股票池，执行基本面 + 技术面 + 规则消息面评分并排序。
 - Script / 脚本: `scanner.py` or `python main.py scan`
 
 ### Typical Intents / 典型触发意图
@@ -50,7 +50,7 @@ python scanner.py --top 15 --pool tech_stock_pool.json
 ```json
 {
   "report_type": "scanner",
-  "generated_at": "2026-02-14 10:30:00",
+  "generated_at": "2026-02-15 10:30:00",
   "market_regime": { "regime": "bull|neutral|bear", "reason": "..." },
   "statistics": {
     "total_scanned": 120,
@@ -62,15 +62,15 @@ python scanner.py --top 15 --pool tech_stock_pool.json
     {
       "code": "600519",
       "name": "贵州茅台",
-      "composite_score": 78.5,
+      "composite_score": 78.53,
       "rating": "★★★★☆ 推荐关注",
       "price": 1800.0,
       "pe": 30.5,
       "pb": 8.2,
-      "scores": { "trend": 25, "momentum": 20, "volume": 15, "valuation": 8 },
+      "scores": { "trend": 25.32, "momentum": 20.14, "volume": 15.07, "valuation": 8.0 },
       "signal_tags": ["MACD金叉", "多头排列"],
       "risk_management": { "stop_loss": 1720, "risk_reward": 1.8, "support": 1750, "resistance": 1850 },
-      "sentiment": { "score": 7, "label": "利好", "summary": "..." }
+      "sentiment": { "score": 7, "label": "利好", "summary": "机构评级: 买入/增持; 利好: 业绩增长" }
     }
   ],
   "disclaimer": "..."
@@ -79,8 +79,8 @@ python scanner.py --top 15 --pool tech_stock_pool.json
 
 ### Output Interpretation / 输出解读
 
-- English: Start with scan overview (total, fundamentals pass, technicals pass), then highlight top 3-5 picks with key reasons, signal tags, and risk management data.
-- 中文：先给扫描概览（总数、基本面通过、技术面通过），再列前 3-5 只候选及核心理由、信号标签和风控数据。
+- English: Start with scan overview (total, fundamentals pass, technicals pass), then highlight top 3-5 picks with key reasons, signal tags, and risk management data. Scores use continuous calculation with 2 decimal places for maximum differentiation.
+- 中文：先给扫描概览（总数、基本面通过、技术面通过），再列前 3-5 只候选及核心理由、信号标签和风控数据。评分采用连续化计算，保留2位小数以最大化区分度。
 
 ---
 
@@ -128,7 +128,7 @@ python analyzer.py 贵州茅台
 ```json
 {
   "report_type": "analyzer",
-  "generated_at": "2026-02-14 10:35:00",
+  "generated_at": "2026-02-15 10:35:00",
   "stock": { "code": "600519", "name": "贵州茅台" },
   "market_regime": { "regime": "neutral", "reason": "..." },
   "quote": { "price": 1800, "change_pct": 1.5, "pe": 30.5, "pb": 8.2, "..." : "..." },
@@ -142,7 +142,7 @@ python analyzer.py 贵州茅台
     "stop_loss": 1720, "risk_reward": 1.8
   },
   "news": [ { "title": "...", "source": "...", "time": "..." } ],
-  "sentiment": { "score": 7, "label": "利好", "summary": "..." },
+  "sentiment": { "score": 7, "label": "利好", "summary": "机构评级: 买入; 利好: 业绩增长" },
   "trade_advice": {
     "action": "积极持有",
     "target_price": 2070,
@@ -160,54 +160,12 @@ python analyzer.py 贵州茅台
 
 ---
 
-## Tool 3: `final_report_generator`
-
-### Basics / 基本信息
-
-- English: Orchestrates `scanner.py` and `analyzer.py`, then uses shared LLM config to produce a final consolidated report.
-- 中文：串联 `scanner.py` 与 `analyzer.py`，调用共享 LLM 配置生成最终综合结论。
-- Script / 脚本: `llm_final_report.py` or `python main.py report`
-
-### Typical Intents / 典型触发意图
-
-- English: "Give me a final conclusion", "Full market analysis with specific stock", "Summarize everything"
-- 中文："给我一个最终结论""完整分析市场和个股""把所有分析汇总"
-
-### Command Templates / 命令模板
-
-```bash
-# Recommended: use main.py unified entry
-python main.py report --top 10 --symbol 600519 --json
-
-# Direct script invocation
-python llm_final_report.py --top 10 --symbol 600519 --json
-python llm_final_report.py --top 10 --pool tech_stock_pool.json
-```
-
-### Key Parameters / 关键参数
-
-| Parameter | Description (EN) | 说明 (CN) | Default |
-|-----------|-----------------|-----------|---------|
-| `--symbol` | Stock code (auto-extracted if empty) | 股票代码（空时自动提取） | auto |
-| `--top` | Passed to scanner | 透传到 scanner | `10` |
-| `--pool` | Passed to scanner | 透传到 scanner | `tech_stock_pool.json` |
-| `--json` | Output JSON format | 输出 JSON 格式 | `false` |
-| `--llm-config` | LLM config file path | LLM 配置文件路径 | `llm_config.json` |
-| `--script-timeout` | Subprocess timeout (seconds) | 子进程超时秒数 | `1200` |
-
-### Output Interpretation / 输出解读
-
-- English: This is a decision-oriented final summary produced by LLM. Must include "research only, not investment advice" disclaimer.
-- 中文：这是面向决策的 LLM 生成最终摘要，必须注明"仅供研究，不构成投资建议"。
-
----
-
 ## Orchestration Strategy / 协作策略
 
-1. **Default Flow / 默认流程**: `market_scanner` -> `stock_analyzer` -> `final_report_generator`
+1. **Default Flow / 默认流程**: `market_scanner` -> pick top candidates -> `stock_analyzer` on each
 2. **Single Stock Query / 单一标的**: Call `stock_analyzer` directly
 3. **Quick Market Overview / 快速市场概览**: Call `market_scanner` only
-4. **Full Summary / 完整总结**: Call `final_report_generator` (it orchestrates everything internally)
+4. **Full Summary / 完整总结**: Call both tools, then use OpenClaw's own LLM to synthesize final conclusions
 
 ### Decision Tree / 决策树
 
@@ -215,18 +173,14 @@ python llm_final_report.py --top 10 --pool tech_stock_pool.json
 User Intent
 ├── "扫描/推荐/选股/市场机会" -> market_scanner (scan)
 ├── "分析/看看/这只股票" -> stock_analyzer (analyze)
-├── "最终结论/完整报告/汇总" -> final_report_generator (report)
+├── "最终结论/完整报告/汇总" -> market_scanner + stock_analyzer, then OpenClaw LLM synthesis
 └── Ambiguous -> market_scanner first, then stock_analyzer on top pick
 ```
 
-## Environment Variables / 环境变量
+### LLM Synthesis Notes / LLM 综合分析说明
 
-| Variable | Description | Fallback |
-|----------|-------------|----------|
-| `LLM_URL` | LLM API base URL | `OPENAI_BASE_URL` |
-| `LLM_API_KEY` | LLM API key | `OPENAI_API_KEY` |
-| `LLM_MODEL` | LLM model name | `OPENAI_MODEL` |
-| `LLM_TIMEOUT` | Request timeout (seconds) | `120` |
+- English: When the user requests a comprehensive report, OpenClaw should: (1) run `market_scanner` to get top candidates, (2) run `stock_analyzer` on the top 1-3 picks, (3) use its own LLM reasoning to synthesize a final report combining both outputs. The raw news, announcements, and analyst ratings in the JSON output provide rich context for LLM-based deeper analysis.
+- 中文：当用户需要完整报告时，OpenClaw 应：(1) 运行 `market_scanner` 获取候选，(2) 对前 1-3 只运行 `stock_analyzer`，(3) 用自身 LLM 推理能力综合两者输出生成最终报告。JSON 输出中的原始新闻、公告、机构评级数据为 LLM 深度分析提供丰富上下文。
 
 ## Risk and Compliance / 风险与合规
 
@@ -235,5 +189,5 @@ User Intent
 
 ---
 
-Document Version / 文档版本: `4.0`
-Last Updated / 最后更新: `2026-02-14`
+Document Version / 文档版本: `5.0`
+Last Updated / 最后更新: `2026-02-15`

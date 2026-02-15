@@ -38,7 +38,7 @@ from indicators import (
 from news_analyzer import (
     fetch_stock_news, fetch_stock_notices,
     fetch_institute_recommendations,
-    analyze_sentiment_batch, try_load_llm_config, default_sentiment,
+    analyze_sentiment_batch_rule_based, default_sentiment,
 )
 
 warnings.filterwarnings("ignore")
@@ -386,19 +386,30 @@ def check_technicals(symbol: str, market_regime: str = "neutral") -> dict | None
     volume_score = 0.0   # max 20
 
     # --- Trend Score (30 pts) ---
+    # Base MA arrangement score + continuous micro-adjustment
     if not pd.isna(ma5_now) and not pd.isna(ma10_now):
         if current_price > ma5_now > ma10_now > ma20_now:
             trend_score += 15
+            # Micro-adjust: how far above MA20 (0-1.5 bonus)
+            pct_above = (current_price - ma20_now) / ma20_now if ma20_now > 0 else 0
+            trend_score += min(1.5, pct_above * 15)
         elif current_price > ma5_now > ma20_now:
             trend_score += 12
+            pct_above = (current_price - ma20_now) / ma20_now if ma20_now > 0 else 0
+            trend_score += min(1.0, pct_above * 10)
         elif current_price > ma20_now:
             trend_score += 8
+            pct_above = (current_price - ma20_now) / ma20_now if ma20_now > 0 else 0
+            trend_score += min(0.8, pct_above * 8)
         elif current_price > ma5_now:
             trend_score += 4
 
     if ma60_now is not None:
         if current_price > ma60_now:
             trend_score += 8
+            # Micro-adjust: how far above MA60 (0-0.5 bonus)
+            pct_above_60 = (current_price - ma60_now) / ma60_now if ma60_now > 0 else 0
+            trend_score += min(0.5, pct_above_60 * 5)
         elif current_price > ma60_now * 0.95:
             trend_score += 4
     else:
@@ -409,9 +420,10 @@ def check_technicals(symbol: str, market_regime: str = "neutral") -> dict | None
         if not pd.isna(ma20_5d_ago) and ma20_5d_ago > 0:
             ma20_slope = (ma20_now - ma20_5d_ago) / ma20_5d_ago
             if ma20_slope > 0.01:
-                trend_score += 7
+                # Continuous: 7 base + up to 1.0 for steeper slope
+                trend_score += 7 + min(1.0, (ma20_slope - 0.01) * 50)
             elif ma20_slope > 0:
-                trend_score += 4
+                trend_score += 4 + ma20_slope * 300  # 0-3 extra
             elif ma20_slope > -0.005:
                 trend_score += 2
 
@@ -420,6 +432,10 @@ def check_technicals(symbol: str, market_regime: str = "neutral") -> dict | None
         momentum_score += 12
     elif macd_bullish and macd_now > macd_prev:
         momentum_score += 10
+        # Micro-adjust by histogram acceleration
+        if macd_prev != 0:
+            accel = (macd_now - macd_prev) / abs(macd_prev) if abs(macd_prev) > 0.0001 else 0
+            momentum_score += min(0.8, max(0, accel * 2))
     elif macd_bullish:
         momentum_score += 7
     elif macd_now > macd_prev:
@@ -428,47 +444,51 @@ def check_technicals(symbol: str, market_regime: str = "neutral") -> dict | None
     if dif_now > 0:
         momentum_score += 5
     elif dif_now > -0.5:
-        momentum_score += 2
+        momentum_score += 2 + max(0, (dif_now + 0.5)) * 6  # continuous 2-5
 
-    if 40 <= rsi6 <= 55:
-        momentum_score += 8
-    elif 55 < rsi6 <= 65:
-        momentum_score += 6
-    elif 30 <= rsi6 < 40:
-        momentum_score += 5
-    elif rsi6 < 30:
-        momentum_score += 4
-    elif 65 < rsi6 <= 75:
-        momentum_score += 3
+    # RSI continuous scoring (instead of flat brackets)
+    # Optimal RSI range: 45-55 gets max 8, decays smoothly
+    rsi_optimal = 48.0
+    rsi_dist = abs(rsi6 - rsi_optimal)
+    if rsi_dist <= 7:
+        momentum_score += 8.0 - rsi_dist * 0.15
+    elif rsi_dist <= 18:
+        momentum_score += 6.5 - (rsi_dist - 7) * 0.2
+    elif rsi_dist <= 30:
+        momentum_score += 4.3 - (rsi_dist - 18) * 0.15
     else:
-        momentum_score += 1
+        momentum_score += max(0.5, 2.5 - (rsi_dist - 30) * 0.1)
 
     # --- Volume Score (20 pts) ---
     if vol_ratio is not None:
-        if 1.2 <= vol_ratio <= 2.5:
-            volume_score += 15
-        elif 0.8 <= vol_ratio < 1.2:
-            volume_score += 10
-        elif 2.5 < vol_ratio <= 4.0:
-            volume_score += 8
-        elif 0.5 <= vol_ratio < 0.8:
-            volume_score += 6
-        elif vol_ratio > 4.0:
-            volume_score += 3
+        # Continuous volume scoring: optimal range 1.3-2.0
+        if 1.0 <= vol_ratio <= 3.0:
+            # Peak at vol_ratio=1.6, score 15
+            vr_optimal = 1.6
+            vr_dist = abs(vol_ratio - vr_optimal)
+            volume_score += max(6.0, 15.0 - vr_dist * 4.5)
+        elif 0.7 <= vol_ratio < 1.0:
+            volume_score += 6.0 + (vol_ratio - 0.7) * 13.3
+        elif 3.0 < vol_ratio <= 5.0:
+            volume_score += max(3.0, 8.0 - (vol_ratio - 3.0) * 2.5)
+        elif vol_ratio > 5.0:
+            volume_score += 2.0
         else:
-            volume_score += 2
+            volume_score += max(1.0, vol_ratio * 3)
 
         if len(volume) >= 20:
             vol_5_avg = volume.iloc[-5:].mean()
             vol_20_avg2 = volume.iloc[-20:].mean()
             if vol_20_avg2 > 0:
                 vol_trend = vol_5_avg / vol_20_avg2
-                if 1.1 <= vol_trend <= 2.0:
-                    volume_score += 5
-                elif 0.9 <= vol_trend < 1.1:
-                    volume_score += 3
+                if 1.05 <= vol_trend <= 2.5:
+                    # Continuous: peak at 1.4
+                    vt_dist = abs(vol_trend - 1.4)
+                    volume_score += max(1.0, 5.0 - vt_dist * 2.5)
+                elif 0.8 <= vol_trend < 1.05:
+                    volume_score += 2.0 + (vol_trend - 0.8) * 4
                 else:
-                    volume_score += 1
+                    volume_score += 1.0
     else:
         volume_score += 10
 
@@ -555,10 +575,10 @@ def check_technicals(symbol: str, market_regime: str = "neutral") -> dict | None
         "dea": round(dea_now, 4),
         "macd": round(macd_now, 4),
         "vol_ratio": round(vol_ratio, 2) if vol_ratio else None,
-        "trend_score": round(trend_score, 1),
-        "momentum_score": round(momentum_score, 1),
-        "volume_score": round(volume_score, 1),
-        "tech_total": round(tech_total, 1),
+        "trend_score": round(trend_score, 2),
+        "momentum_score": round(momentum_score, 2),
+        "volume_score": round(volume_score, 2),
+        "tech_total": round(tech_total, 2),
         "signal_tags": signal_tags,
         "divergence": divergence,
         "pullback_ma20": pullback_ma20,
@@ -570,46 +590,53 @@ def check_technicals(symbol: str, market_regime: str = "neutral") -> dict | None
     }
 
 
+def _valuation_pe_score(pe: float | None) -> float:
+    """
+    Continuous PE scoring (max 10).
+    Sweet spot: PE=12 gets 10.0, scores decay smoothly away from sweet spot.
+    """
+    if pe is None or pe <= 0:
+        return 1.0
+    # Optimal PE = 12, use gaussian-like decay
+    optimal = 12.0
+    if pe <= optimal:
+        # Score rises from 1.0 at pe=0 to 10.0 at pe=12
+        return max(1.0, 10.0 - (optimal - pe) ** 1.3 * 0.15)
+    else:
+        # Score decays from 10.0 at pe=12 toward 1.0 at pe=80
+        return max(1.0, 10.0 - (pe - optimal) ** 1.1 * 0.12)
+
+
+def _valuation_pb_score(pb: float | None) -> float:
+    """
+    Continuous PB scoring (max 5).
+    Sweet spot: PB=1.5 gets 5.0, scores decay smoothly away from sweet spot.
+    """
+    if pb is None or pb <= 0:
+        return 0.5
+    optimal = 1.5
+    if pb <= optimal:
+        return max(0.5, 5.0 - (optimal - pb) ** 1.2 * 2.0)
+    else:
+        return max(0.5, 5.0 - (pb - optimal) ** 1.1 * 0.6)
+
+
 def composite_score(tech: dict, pe: float, pb: float,
-                    sentiment_score: int = 5) -> float:
+                    sentiment_score: float = 5.0) -> float:
     """
     Compute final composite score:
       Technical (max 75) + Valuation (max 15) + Sentiment (max 10) = 100
+
+    Uses continuous valuation scoring for better differentiation.
     """
     tech_total = tech["tech_total"]
 
-    val_score = 0.0
-    if pe is not None:
-        if 8 <= pe <= 15:
-            val_score += 10
-        elif 15 < pe <= 25:
-            val_score += 8
-        elif 25 < pe <= 35:
-            val_score += 6
-        elif 35 < pe <= 50:
-            val_score += 4
-        elif 5 <= pe < 8:
-            val_score += 7
-        elif pe > 50:
-            val_score += 2
-        else:
-            val_score += 1
+    val_score = _valuation_pe_score(pe) + _valuation_pb_score(pb)
+    val_score = min(15.0, val_score)
 
-    if pb is not None:
-        if 1.0 <= pb <= 2.5:
-            val_score += 5
-        elif 2.5 < pb <= 4.0:
-            val_score += 4
-        elif 0.5 <= pb < 1.0:
-            val_score += 3
-        elif 4.0 < pb <= 6.0:
-            val_score += 2
-        else:
-            val_score += 1
+    sent_score = max(0.0, min(10.0, float(sentiment_score)))
 
-    sent_score = max(0, min(10, sentiment_score))
-
-    return round(tech_total + val_score + sent_score, 1)
+    return round(tech_total + val_score + sent_score, 2)
 
 
 def score_to_rating(score: float) -> str:
@@ -815,12 +842,6 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
     if not pool.exists():
         raise FileNotFoundError(f"股票池文件不存在: {pool}")
 
-    llm_cfg = try_load_llm_config()
-    if llm_cfg:
-        print("  [INFO] LLM已配置，将启用消息面情感分析", file=sys.stderr)
-    else:
-        print("  [INFO] 未配置LLM，消息面评分使用默认中性值", file=sys.stderr)
-
     emit_event("step", current=1, total=7, desc="检测大盘环境")
     print("[1/7] 检测大盘环境...", file=sys.stderr)
     market_info = check_market_regime()
@@ -917,7 +938,12 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
     after_technical = len(candidates)
     print(f"    技术面通过: {after_technical}", file=sys.stderr)
 
-    candidates.sort(key=lambda x: x["composite_score"], reverse=True)
+    candidates.sort(key=lambda x: (
+        x["composite_score"],
+        x["trend_score"],
+        x["momentum_score"],
+        x["volume_score"],
+    ), reverse=True)
 
     # --- Step 5: Fetch news for top candidates ---
     emit_event("step", current=5, total=7, desc="获取候选股票新闻、公告、研报")
@@ -946,16 +972,16 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
         time.sleep(0.1)
     print("", file=sys.stderr)
 
-    # --- Step 6: LLM batch sentiment analysis ---
-    emit_event("step", current=6, total=7, desc="LLM消息面情感分析")
-    print("[6/7] LLM消息面情感分析...", file=sys.stderr)
-    sentiment_results = analyze_sentiment_batch(llm_cfg, stocks_data)
+    # --- Step 6: Rule-based sentiment analysis ---
+    emit_event("step", current=6, total=7, desc="规则消息面情感分析")
+    print("[6/7] 规则消息面情感分析...", file=sys.stderr)
+    sentiment_results = analyze_sentiment_batch_rule_based(stocks_data)
 
     for stock in top_candidates:
         code = stock["code"]
         sentiment = sentiment_results.get(code, default_sentiment())
         stock["sentiment"] = sentiment
-        sent_score = sentiment.get("score", 5)
+        sent_score = sentiment.get("raw_score", sentiment.get("score", 5))
         tech_data = {
             "tech_total": stock["trend_score"] + stock["momentum_score"] + stock["volume_score"],
         }
@@ -963,13 +989,19 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
             tech_data, stock["pe"], stock["pb"], sentiment_score=sent_score
         )
         stock["val_score"] = round(
-            stock["composite_score"] - tech_data["tech_total"] - max(0, min(10, sent_score)), 1
+            stock["composite_score"] - tech_data["tech_total"] - max(0.0, min(10.0, sent_score)), 2
         )
 
     for stock in candidates[n_candidates:]:
         stock["sentiment"] = default_sentiment()
 
-    candidates.sort(key=lambda x: x["composite_score"], reverse=True)
+    # Multi-key sort for better differentiation (breaks ties)
+    candidates.sort(key=lambda x: (
+        x["composite_score"],
+        x["trend_score"],
+        x["momentum_score"],
+        x["volume_score"],
+    ), reverse=True)
     print(f"    消息面分析完成，已更新{n_candidates}只股票的评分", file=sys.stderr)
 
     # --- Step 7: Generate report ---

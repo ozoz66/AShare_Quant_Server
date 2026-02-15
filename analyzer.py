@@ -33,7 +33,7 @@ from indicators import (
 from news_analyzer import (
     fetch_stock_news, fetch_stock_notices,
     fetch_institute_recommendations,
-    analyze_sentiment, try_load_llm_config, default_sentiment,
+    analyze_sentiment_rule_based, default_sentiment,
 )
 
 warnings.filterwarnings("ignore")
@@ -790,7 +790,7 @@ def output_report_text(name: str, code: str, quote: dict | None, info: dict, fin
     if sentiment and sentiment.get("score", 5) != 5:
         sent_score = sentiment.get("score", 5)
         sent_label = sentiment.get("label", "中性")
-        lines.append(f"### LLM 情绪判断: {sent_label} ({sent_score}/10)\n")
+        lines.append(f"### 情绪判断: {sent_label} ({sent_score}/10)\n")
         lines.append("| 指标 | 结果 |")
         lines.append("|------|------|")
         lines.append(f"| 情绪评分 | {sent_score}/10 ({sent_label}) |")
@@ -802,7 +802,7 @@ def output_report_text(name: str, code: str, quote: dict | None, info: dict, fin
         if summary:
             lines.append(f"| 一句话总结 | {summary} |")
     else:
-        lines.append("*消息面情绪: 中性 (数据不足或未配置LLM)*\n")
+        lines.append("*消息面情绪: 中性 (数据不足)*\n")
 
     if notices:
         lines.append(f"\n### 公司公告 (最近{len(notices)}条)\n")
@@ -876,12 +876,6 @@ def run_analyzer(symbol: str, output_json: bool = False) -> dict | str:
     if not symbol:
         raise ValueError("未提供股票代码或名称")
 
-    llm_cfg = try_load_llm_config()
-    if llm_cfg:
-        print("  [INFO] LLM已配置，将启用消息面情感分析", file=sys.stderr)
-    else:
-        print("  [INFO] 未配置LLM，消息面评分使用默认中性值", file=sys.stderr)
-
     emit_event("step", current=1, total=10, desc="检测大盘环境")
     print(">>> [1/10] 检测大盘环境...", file=sys.stderr)
     mkt = check_market_regime()
@@ -930,9 +924,9 @@ def run_analyzer(symbol: str, output_json: bool = False) -> dict | str:
         print(">>> [bonus] 尝试腾讯行情补充实时数据...", file=sys.stderr)
         quote = fetch_tencent_quote(code)
 
-    emit_event("step", current=8, total=10, desc="LLM消息面情感分析")
-    print(">>> [8/10] LLM消息面情感分析...", file=sys.stderr)
-    sentiment = analyze_sentiment(llm_cfg, news, notices, reports_data)
+    emit_event("step", current=8, total=10, desc="规则消息面情感分析")
+    print(">>> [8/10] 规则消息面情感分析...", file=sys.stderr)
+    sentiment = analyze_sentiment_rule_based(news, notices, reports_data)
     print(f"    情感分析: {sentiment.get('label', '中性')} ({sentiment.get('score', 5)}/10)", file=sys.stderr)
 
     emit_event("step", current=9, total=10, desc="生成交易建议")
