@@ -58,10 +58,29 @@ python main.py scan --top 10
 # Batch screening (JSON output for LLM agents)
 python main.py scan --top 10 --json
 
+# Batch screening with custom weights
+python main.py scan --top 10 --trend-weight 0.4 --momentum-weight 0.2 --volume-weight 0.2
+
+# Using different stock pools
+python main.py scan --top 10 --pool blue_chip_pool.json
+
 # Single stock analysis
 python main.py analyze --symbol 600519
 python main.py analyze --symbol 贵州茅台 --json
 ```
+
+**Custom Weights Parameters:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--trend-weight` | 0.30 | Trend factor weight (30%) |
+| `--momentum-weight` | 0.25 | Momentum factor weight (25%) |
+| `--volume-weight` | 0.20 | Volume factor weight (20%) |
+| `--valuation-weight` | 0.15 | Valuation factor weight (15%) |
+| `--sentiment-weight` | 0.10 | Sentiment factor weight (10%) |
+
+**Stock Pools:**
+- `tech_stock_pool.json` - Default (~120 tech/stock pool)
+- `blue_chip_pool.json` - Blue chip stocks (50 large caps)
 
 You can also call individual scripts directly:
 
@@ -165,10 +184,29 @@ python main.py scan --top 10
 # 批量选股（JSON 输出，供 LLM Agent 解析）
 python main.py scan --top 10 --json
 
+# 自定义权重选股
+python main.py scan --top 10 --trend-weight 0.4 --momentum-weight 0.2 --volume-weight 0.2
+
+# 使用不同股票池
+python main.py scan --top 10 --pool blue_chip_pool.json
+
 # 单股分析
 python main.py analyze --symbol 600519
 python main.py analyze --symbol 贵州茅台 --json
 ```
+
+**自定义权重参数：**
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--trend-weight` | 0.30 | 趋势因子权重 (30%) |
+| `--momentum-weight` | 0.25 | 动量因子权重 (25%) |
+| `--volume-weight` | 0.20 | 量能因子权重 (20%) |
+| `--valuation-weight` | 0.15 | 估值因子权重 (15%) |
+| `--sentiment-weight` | 0.10 | 消息面因子权重 (10%) |
+
+**股票池：**
+- `tech_stock_pool.json` - 默认股票池（约120只）
+- `blue_chip_pool.json` - 蓝筹股池（50只大盘股）
 
 也可以直接调用单独脚本：
 

@@ -15,6 +15,9 @@ All subcommands support --json flag for structured JSON output.
 Usage:
   python main.py scan --top 10 --json
   python main.py analyze --symbol 600519 --json
+  
+Custom weights example:
+  python main.py scan --top 10 --trend-weight 0.4 --momentum-weight 0.2
 """
 
 import argparse
@@ -29,11 +32,26 @@ configure_stdio()
 def cmd_scan(args):
     """Execute batch stock screening."""
     from scanner import run_scanner
+    
+    # Build weights dict from arguments
+    weights = {}
+    if args.trend_weight is not None:
+        weights['trend'] = args.trend_weight
+    if args.momentum_weight is not None:
+        weights['momentum'] = args.momentum_weight
+    if args.volume_weight is not None:
+        weights['volume'] = args.volume_weight
+    if args.valuation_weight is not None:
+        weights['valuation'] = args.valuation_weight
+    if args.sentiment_weight is not None:
+        weights['sentiment'] = args.sentiment_weight
+    
     result = run_scanner(
         top_n=args.top,
         pool_path=args.pool,
         output_dir=args.output_dir,
         output_json=args.json,
+        weights=weights if weights else None,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -67,6 +85,12 @@ def main():
     p_scan.add_argument("--pool", type=str, default="tech_stock_pool.json", help="Stock pool JSON path")
     p_scan.add_argument("--output-dir", type=str, default="output", help="Output directory")
     p_scan.add_argument("--json", action="store_true", help="Output JSON format")
+    # Custom scoring weights
+    p_scan.add_argument("--trend-weight", type=float, default=None, help="Trend factor weight (default: 0.30)")
+    p_scan.add_argument("--momentum-weight", type=float, default=None, help="Momentum factor weight (default: 0.25)")
+    p_scan.add_argument("--volume-weight", type=float, default=None, help="Volume factor weight (default: 0.20)")
+    p_scan.add_argument("--valuation-weight", type=float, default=None, help="Valuation factor weight (default: 0.15)")
+    p_scan.add_argument("--sentiment-weight", type=float, default=None, help="Sentiment factor weight (default: 0.10)")
     p_scan.set_defaults(func=cmd_scan)
 
     # --- analyze ---

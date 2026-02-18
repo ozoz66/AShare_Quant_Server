@@ -829,12 +829,36 @@ def save_report(report_text: str, output_dir: Path) -> Path:
 # Main
 # ---------------------------------------------------------------------------
 
+# Default scoring weights
+DEFAULT_WEIGHTS = {
+    "trend": 0.30,      # 30 points max
+    "momentum": 0.25,   # 25 points max
+    "volume": 0.20,     # 20 points max
+    "valuation": 0.15, # 15 points max
+    "sentiment": 0.10,  # 10 points max
+}
+
 def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
-                output_dir: str = "output", output_json: bool = False) -> dict | str:
+                output_dir: str = "output", output_json: bool = False,
+                weights: dict = None) -> dict | str:
     """
     Core scanner logic. Returns JSON dict if output_json=True, else text report string.
     Can be called programmatically or from CLI.
+    
+    Args:
+        top_n: Number of top stocks to return
+        pool_path: Path to stock pool JSON file
+        output_dir: Directory for output files
+        output_json: Whether to output JSON format
+        weights: Optional dict with custom weights for scoring factors.
+                 Keys: trend, momentum, volume, valuation, sentiment
+                 Values: float (e.g., 0.3 for 30%)
     """
+    # Merge custom weights with defaults
+    scoring_weights = DEFAULT_WEIGHTS.copy()
+    if weights:
+        scoring_weights.update(weights)
+    
     pool = Path(pool_path)
     if not pool.is_absolute():
         pool = Path(__file__).resolve().parent / pool
