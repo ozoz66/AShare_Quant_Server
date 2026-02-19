@@ -29,6 +29,7 @@ from indicators import (
     bs_login, bs_logout,
     calculate_rsi, calculate_macd, calculate_kdj, calculate_bollinger,
     calculate_atr, detect_macd_divergence, check_pullback_to_ma,
+    check_market_regime, retry
 )
 from news_analyzer import (
     fetch_stock_news, fetch_stock_notices,
@@ -46,34 +47,7 @@ os.environ["NO_PROXY"] = "*"
 configure_stdio()
 
 
-def check_market_regime() -> dict:
-    """Analyze Shanghai Composite to determine market context."""
-    try:
-        df = ak.stock_zh_index_daily(symbol="sh000001")
-        if df is None or df.empty or len(df) < 60:
-            return {"regime": "neutral", "reason": "数据不足"}
-        close_col = pick_col(df, ["close", "收盘"])
-        if close_col is None:
-            return {"regime": "neutral", "reason": "无收盘列"}
-        close = df[close_col].astype(float).iloc[-120:]
-        ma20 = close.rolling(20).mean()
-        ma60 = close.rolling(60).mean()
-        p, m20, m60 = close.iloc[-1], ma20.iloc[-1], ma60.iloc[-1]
-        m20_slope = (ma20.iloc[-1] - ma20.iloc[-6]) / ma20.iloc[-6] if not pd.isna(ma20.iloc[-6]) else 0
-        score = 0
-        if p > m20: score += 1
-        else: score -= 1
-        if not pd.isna(m60):
-            if p > m60: score += 1
-            else: score -= 1
-        if m20_slope > 0.005: score += 1
-        elif m20_slope < -0.005: score -= 1
-        if score >= 2: regime = "bull"
-        elif score <= -2: regime = "bear"
-        else: regime = "neutral"
-        return {"regime": regime, "score": score, "reason": f"指数在MA20之{'上' if p > m20 else '下'}"}
-    except Exception:
-        return {"regime": "neutral", "reason": "行情获取异常"}
+# Removed local check_market_regime as it is imported from indicators.py
 
 
 def normalize_quote_from_ak(row: dict) -> dict:
@@ -144,6 +118,7 @@ def fetch_tencent_quote(code: str) -> dict | None:
         return None
 
 
+@retry(max_attempts=2, delay=1.0)
 def resolve_symbol(user_input: str) -> tuple[str | None, str | None, dict | None]:
     try:
         print("  正在获取股票列表以匹配输入...", file=sys.stderr)
@@ -192,6 +167,7 @@ def resolve_symbol(user_input: str) -> tuple[str | None, str | None, dict | None
         return None, None, None
 
 
+@retry(max_attempts=3, delay=1.0)
 def fetch_daily_history(symbol: str, days: int = 180) -> pd.DataFrame | None:
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
@@ -247,6 +223,7 @@ def fetch_daily_history(symbol: str, days: int = 180) -> pd.DataFrame | None:
         return None
 
 
+@retry(max_attempts=2, delay=1.0)
 def fetch_individual_info(symbol: str) -> dict:
     try:
         df = ak.stock_individual_info_em(symbol=symbol)
@@ -356,8 +333,16 @@ def compute_technicals(hist: pd.DataFrame) -> dict | None:
 
     bb_upper, bb_mid, bb_lower = calculate_bollinger(close)
     bb_u, bb_m, bb_l = _v(bb_upper), _v(bb_mid), _v(bb_lower)
-    bb_width = round((bb_u - bb_l) / bb_m * 100, 1) if bb_m and bb_m > 0 and bb_u and bb_l else None
-    bb_pos = round((price - bb_l) / (bb_u - bb_l) * 100, 1) if bb_u and bb_l and (bb_u - bb_l) > 0 else None
+    bb_width = (
+        round((bb_u - bb_l) / bb_m * 100, 1)
+        if bb_m is not None and bb_m > 0 and bb_u is not None and bb_l is not None
+        else None
+    )
+    bb_pos = (
+        round((price - bb_l) / (bb_u - bb_l) * 100, 1)
+        if bb_u is not None and bb_l is not None and (bb_u - bb_l) > 0
+        else None
+    )
 
     vol_ratio = vol_trend_ratio = None
     vol_label = "N/A"
@@ -423,23 +408,28 @@ def compute_technicals(hist: pd.DataFrame) -> dict | None:
     if dif_now is not None:
         signals.append(f"DIF {'>' if dif_now > 0 else '<'} 0, 中期趋势偏{'多' if dif_now > 0 else '空'}")
 
-    if ma5_now and ma10_now and ma20_now:
+    if ma5_now is not None and ma10_now is not None and ma20_now is not None:
         if price > ma5_now > ma10_now > ma20_now:
             signals.append("均线完美多头排列 (价格>MA5>MA10>MA20)")
         elif price > ma5_now > ma20_now:
             signals.append("均线多头排列 (价格>MA5>MA20)")
         elif price < ma5_now < ma20_now:
             signals.append("均线空头排列 (价格<MA5<MA20)")
-        elif ma20_now and price > ma20_now:
+        elif price > ma20_now:
             signals.append("价格站上MA20, 中期支撑有效")
-        elif ma20_now:
+        else:
             signals.append("价格跌破MA20, 中期支撑失守")
 
-    if ma60_now:
+    if ma60_now is not None:
         signals.append(f"价格{'站上' if price > ma60_now else '跌破'}MA60 (长期趋势)")
 
     ma5_prev, ma20_prev_v = _v(ma5, -2), _v(ma20, -2)
-    if ma5_prev and ma20_prev_v and ma5_now and ma20_now:
+    if (
+        ma5_prev is not None
+        and ma20_prev_v is not None
+        and ma5_now is not None
+        and ma20_now is not None
+    ):
         if ma5_prev <= ma20_prev_v and ma5_now > ma20_now:
             signals.append("MA5/MA20 金叉")
         elif ma5_prev >= ma20_prev_v and ma5_now < ma20_now:
@@ -468,20 +458,20 @@ def compute_technicals(hist: pd.DataFrame) -> dict | None:
             elif k_prev >= d_prev_v and k_val < d_val:
                 signals.append("KDJ 死叉")
 
-    if bb_u and bb_l:
+    if bb_u is not None and bb_l is not None:
         if price >= bb_u:
             signals.append("价格触及布林上轨, 注意压力")
         elif price <= bb_l:
             signals.append("价格触及布林下轨, 关注支撑")
-        if bb_width and bb_width < 5:
+        if bb_width is not None and bb_width < 5:
             signals.append("布林带收窄, 可能即将变盘")
 
     if vol_label != "N/A":
         price_up = close.iloc[-1] > close.iloc[-2] if len(close) >= 2 else False
         signals.append(f"量能: {vol_label} (量比{vol_ratio})")
-        if vol_ratio and vol_ratio > 1.3 and price_up:
+        if vol_ratio is not None and vol_ratio > 1.3 and price_up:
             signals.append("量价配合良好 (放量上涨)")
-        elif vol_ratio and vol_ratio > 1.3 and not price_up:
+        elif vol_ratio is not None and vol_ratio > 1.3 and not price_up:
             signals.append("放量下跌, 注意风险")
 
     # =================================================================
@@ -489,34 +479,52 @@ def compute_technicals(hist: pd.DataFrame) -> dict | None:
     # =================================================================
     score = 0.0
 
-    if ma5_now and ma10_now and ma20_now:
+    if ma5_now is not None and ma10_now is not None and ma20_now is not None:
         if price > ma5_now > ma10_now > ma20_now: score += 15
         elif price > ma5_now > ma20_now: score += 12
-        elif ma20_now and price > ma20_now: score += 8
-        elif ma5_now and price > ma5_now: score += 4
-    if ma60_now and price > ma60_now: score += 8
+        elif price > ma20_now: score += 8
+        elif price > ma5_now: score += 4
+    if ma60_now is not None and price > ma60_now: score += 8
     elif ma60_now is None: score += 4
-    if ma20_now and len(ma20) >= 6:
+    if ma20_now is not None and len(ma20) >= 6:
         ma20_5ago = _v(ma20, -6)
-        if ma20_5ago and ma20_5ago > 0:
+        if ma20_5ago is not None and ma20_5ago > 0:
             slope = (ma20_now - ma20_5ago) / ma20_5ago
             if slope > 0.01: score += 7
             elif slope > 0: score += 4
             elif slope > -0.005: score += 2
 
     if macd_golden: score += 12
-    elif dif_now and dea_now and dif_now > dea_now and macd_now and macd_prev and macd_now > macd_prev: score += 10
-    elif dif_now and dea_now and dif_now > dea_now: score += 7
-    elif macd_now and macd_prev and macd_now > macd_prev: score += 4
-    if dif_now and dif_now > 0: score += 5
-    elif dif_now and dif_now > -0.5: score += 2
-    if rsi6_now:
+    elif (
+        dif_now is not None
+        and dea_now is not None
+        and dif_now > dea_now
+        and macd_now is not None
+        and macd_prev is not None
+        and macd_now > macd_prev
+    ):
+        score += 10
+    elif dif_now is not None and dea_now is not None and dif_now > dea_now:
+        score += 7
+    elif macd_now is not None and macd_prev is not None and macd_now > macd_prev:
+        score += 4
+    if dif_now is not None and dif_now > 0:
+        score += 5
+    elif dif_now is not None and dif_now > -0.5:
+        score += 2
+    if rsi6_now is not None:
         if 40 <= rsi6_now <= 55: score += 8
         elif 55 < rsi6_now <= 65: score += 6
         elif 30 <= rsi6_now < 40: score += 5
         elif 65 < rsi6_now <= 75: score += 3
         else: score += 1
-    if k_val and d_val and j_val and k_val > d_val and 20 < j_val < 80:
+    if (
+        k_val is not None
+        and d_val is not None
+        and j_val is not None
+        and k_val > d_val
+        and 20 < j_val < 80
+    ):
         score += 5
 
     if vol_ratio is not None:
@@ -525,8 +533,8 @@ def compute_technicals(hist: pd.DataFrame) -> dict | None:
         elif 2.5 < vol_ratio <= 4.0: score += 6
         elif 0.5 <= vol_ratio < 0.8: score += 4
         else: score += 2
-        if vol_trend_ratio and 1.1 <= vol_trend_ratio <= 2.0: score += 5
-        elif vol_trend_ratio and 0.9 <= vol_trend_ratio < 1.1: score += 3
+        if vol_trend_ratio is not None and 1.1 <= vol_trend_ratio <= 2.0: score += 5
+        elif vol_trend_ratio is not None and 0.9 <= vol_trend_ratio < 1.1: score += 3
         else: score += 1
     else:
         score += 10
@@ -540,8 +548,8 @@ def compute_technicals(hist: pd.DataFrame) -> dict | None:
     if divergence == "bottom_divergence": bonus += 8
     elif divergence == "top_divergence": bonus -= 8
     if pullback_ma20: bonus += 5
-    if risk_reward and risk_reward > 2.0: bonus += 3
-    elif risk_reward and risk_reward < 0.8: bonus -= 3
+    if risk_reward is not None and risk_reward > 2.0: bonus += 3
+    elif risk_reward is not None and risk_reward < 0.8: bonus -= 3
 
     score = max(0, min(100, round(score + bonus, 1)))
     if score >= 80: rating = "★★★★★ 强烈看多"

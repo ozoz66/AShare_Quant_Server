@@ -21,6 +21,7 @@ import os
 import sys
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from indicators import (
     configure_stdio, emit_event, to_float, pick_col,
     bs_login, bs_logout,
     calculate_rsi, calculate_macd, calculate_kdj, calculate_atr,
-    detect_macd_divergence, check_pullback_to_ma,
+    detect_macd_divergence, check_pullback_to_ma, check_market_regime, retry
 )
 from news_analyzer import (
     fetch_stock_news, fetch_stock_notices,
@@ -56,59 +57,7 @@ configure_stdio()
 # Data Fetching
 # ---------------------------------------------------------------------------
 
-def check_market_regime() -> dict:
-    """
-    Check overall market regime by analyzing Shanghai Composite.
-    Returns regime info: 'bull', 'neutral', or 'bear' with confidence.
-    """
-    try:
-        df = ak.stock_zh_index_daily(symbol="sh000001")
-        if df is None or df.empty or len(df) < 60:
-            return {"regime": "neutral", "confidence": 0.0, "reason": "数据不足"}
-        close_col = pick_col(df, ["close", "收盘"])
-        if close_col is None:
-            return {"regime": "neutral", "confidence": 0.0, "reason": "无收盘列"}
-        close = df[close_col].astype(float).iloc[-120:]
-        ma20 = close.rolling(20).mean()
-        ma60 = close.rolling(60).mean()
-        p = close.iloc[-1]
-        ma20_now = ma20.iloc[-1]
-        ma60_now = ma60.iloc[-1] if not pd.isna(ma60.iloc[-1]) else None
-
-        ma20_slope = (ma20.iloc[-1] - ma20.iloc[-6]) / ma20.iloc[-6] if not pd.isna(ma20.iloc[-6]) and ma20.iloc[-6] > 0 else 0
-
-        score = 0.0
-        reasons = []
-        if p > ma20_now:
-            score += 1
-            reasons.append("指数>MA20")
-        else:
-            score -= 1
-            reasons.append("指数<MA20")
-        if ma60_now and p > ma60_now:
-            score += 1
-            reasons.append("指数>MA60")
-        elif ma60_now:
-            score -= 1
-            reasons.append("指数<MA60")
-        if ma20_slope > 0.005:
-            score += 1
-            reasons.append("MA20上升")
-        elif ma20_slope < -0.005:
-            score -= 1
-            reasons.append("MA20下降")
-
-        if score >= 2:
-            regime = "bull"
-        elif score <= -2:
-            regime = "bear"
-        else:
-            regime = "neutral"
-        return {"regime": regime, "confidence": abs(score) / 3.0,
-                "reason": "; ".join(reasons), "score": score}
-    except Exception as e:
-        print(f"  [WARN] 大盘环境检测失败: {e}", file=sys.stderr)
-        return {"regime": "neutral", "confidence": 0.0, "reason": f"检测异常: {e}"}
+# Removed local check_market_regime as it is imported from indicators.py
 
 def load_stock_codes(pool_path: Path) -> list[str]:
     with pool_path.open("r", encoding="utf-8") as f:
@@ -209,6 +158,7 @@ def filter_fundamentals(df: pd.DataFrame) -> pd.DataFrame:
     return f
 
 
+@retry(max_attempts=3, delay=1.0)
 def fetch_history(symbol: str, days: int = 150) -> pd.DataFrame | None:
     """Fetch history with close, high, low, volume columns for scoring."""
     end_date = datetime.now().strftime("%Y%m%d")
@@ -900,64 +850,70 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
         return report_text
 
     emit_event("step", current=4, total=7, desc="技术面分析与多因子评分")
-    print("[4/7] 技术面分析 & 多因子评分...", file=sys.stderr)
+    print("[4/7] 技术面分析 & 多因子评分 (并行执行)...", file=sys.stderr)
     fundamentals = fundamentals.sort_values("mkt_cap", ascending=False).reset_index(drop=True)
 
     candidates: list[dict] = []
-    checked = 0
+    
+    def process_single_stock(row):
+        code = str(row["code"])
+        name = str(row["name"])
+        tech = check_technicals(code, market_regime=regime)
+        if tech is None:
+            return None
+        
+        pe_val = round(float(row["pe"]), 2)
+        pb_val = round(float(row["pb"]), 2)
+        total_score = composite_score(tech, pe_val, pb_val)
+        val_score = round(total_score - tech["tech_total"], 1)
+
+        if regime == "bear" and total_score < 55:
+            return None
+
+        return {
+            "code": code,
+            "name": name,
+            "price": tech["price"],
+            "pe": pe_val,
+            "pb": pb_val,
+            "mkt_cap_yi": round(float(row["mkt_cap"]) / 1e8, 1),
+            "rsi6": tech["rsi6"],
+            "rsi12": tech["rsi12"],
+            "rsi24": tech["rsi24"],
+            "dif": tech["dif"],
+            "dea": tech["dea"],
+            "macd": tech["macd"],
+            "vol_ratio": tech["vol_ratio"],
+            "trend_score": tech["trend_score"],
+            "momentum_score": tech["momentum_score"],
+            "volume_score": tech["volume_score"],
+            "val_score": val_score,
+            "composite_score": total_score,
+            "signal_tags": tech["signal_tags"],
+            "stop_loss": tech.get("stop_loss"),
+            "risk_reward": tech.get("risk_reward"),
+            "support": tech.get("support"),
+            "resistance": tech.get("resistance"),
+            "news_list": [],
+        }
+
+    # Use ThreadPoolExecutor for Step 4
+    max_workers = 8
     bs_login()
     try:
-        for _, row in fundamentals.iterrows():
-            checked += 1
-            code = str(row["code"])
-            name = str(row["name"])
-            print(f"\r    进度: {checked}/{len(fundamentals)} - {code} {name}",
-                  end="", file=sys.stderr)
-
-            tech = check_technicals(code, market_regime=regime)
-            if tech is None:
-                continue
-
-            pe_val = round(float(row["pe"]), 2)
-            pb_val = round(float(row["pb"]), 2)
-            total_score = composite_score(tech, pe_val, pb_val)
-            val_score = round(total_score - tech["tech_total"], 1)
-
-            if regime == "bear" and total_score < 55:
-                continue
-
-            candidates.append(
-                {
-                    "code": code,
-                    "name": name,
-                    "price": tech["price"],
-                    "pe": pe_val,
-                    "pb": pb_val,
-                    "mkt_cap_yi": round(float(row["mkt_cap"]) / 1e8, 1),
-                    "rsi6": tech["rsi6"],
-                    "rsi12": tech["rsi12"],
-                    "rsi24": tech["rsi24"],
-                    "dif": tech["dif"],
-                    "dea": tech["dea"],
-                    "macd": tech["macd"],
-                    "vol_ratio": tech["vol_ratio"],
-                    "trend_score": tech["trend_score"],
-                    "momentum_score": tech["momentum_score"],
-                    "volume_score": tech["volume_score"],
-                    "val_score": val_score,
-                    "composite_score": total_score,
-                    "signal_tags": tech["signal_tags"],
-                    "stop_loss": tech.get("stop_loss"),
-                    "risk_reward": tech.get("risk_reward"),
-                    "support": tech.get("support"),
-                    "resistance": tech.get("resistance"),
-                    "news_list": [],
-                }
-            )
-            time.sleep(0.03)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_single_stock, row): row for _, row in fundamentals.iterrows()}
+            checked = 0
+            for future in as_completed(futures):
+                checked += 1
+                result = future.result()
+                if result:
+                    candidates.append(result)
+                print(f"\r    进度: {checked}/{len(fundamentals)}", end="", file=sys.stderr)
     finally:
         bs_logout()
-        print("", file=sys.stderr)
+    
+    print("", file=sys.stderr)
 
     after_technical = len(candidates)
     print(f"    技术面通过: {after_technical}", file=sys.stderr)
@@ -969,31 +925,40 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
         x["volume_score"],
     ), reverse=True)
 
-    # --- Step 5: Fetch news for top candidates ---
+    # --- Step 5: Fetch news for top candidates (Parallel) ---
     emit_event("step", current=5, total=7, desc="获取候选股票新闻、公告、研报")
     n_candidates = min(len(candidates), top_n * 2)
     top_candidates = candidates[:n_candidates]
-    print(f"[5/7] 获取前{n_candidates}只候选股票的新闻、公告、研报...", file=sys.stderr)
+    print(f"[5/7] 获取前{n_candidates}只候选股票的新闻、公告、研报 (并行执行)...", file=sys.stderr)
 
-    stocks_data: dict[str, dict] = {}
-    for idx, stock in enumerate(top_candidates):
+    def fetch_stock_data(stock):
         code = stock["code"]
-        name = stock["name"]
-        print(f"\r    进度: {idx + 1}/{n_candidates} - {code} {name}",
-              end="", file=sys.stderr)
         news = fetch_stock_news(code, count=5)
         notices = fetch_stock_notices(code, count=3)
         reports = fetch_institute_recommendations(code, count=3)
-        stock["news_list"] = news
-        stock["notices"] = notices
-        stock["reports"] = reports
-        stocks_data[code] = {
-            "name": name,
-            "news": news,
-            "notices": notices,
-            "reports": reports,
-        }
-        time.sleep(0.1)
+        return code, news, notices, reports
+
+    stocks_data: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fetch_stock_data, s): s for s in top_candidates}
+        done_count = 0
+        for future in as_completed(futures):
+            done_count += 1
+            code, news, notices, reports = future.result()
+            # Update the original stock object in candidates list
+            for s in top_candidates:
+                if s["code"] == code:
+                    s["news_list"] = news
+                    s["notices"] = notices
+                    s["reports"] = reports
+                    stocks_data[code] = {
+                        "name": s["name"],
+                        "news": news,
+                        "notices": notices,
+                        "reports": reports,
+                    }
+                    break
+            print(f"\r    进度: {done_count}/{n_candidates}", end="", file=sys.stderr)
     print("", file=sys.stderr)
 
     # --- Step 6: Rule-based sentiment analysis ---

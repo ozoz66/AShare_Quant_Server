@@ -15,13 +15,14 @@ from datetime import datetime
 
 import akshare as ak
 
-from indicators import to_float, pick_col
+from indicators import to_float, pick_col, retry
 
 
 # ---------------------------------------------------------------------------
 # Data Fetching
 # ---------------------------------------------------------------------------
 
+@retry(max_attempts=3, delay=1.0)
 def fetch_stock_news(symbol: str, count: int = 5) -> list[dict]:
     """Fetch recent news for a stock from East Money."""
     try:
@@ -45,6 +46,7 @@ def fetch_stock_news(symbol: str, count: int = 5) -> list[dict]:
         return []
 
 
+@retry(max_attempts=3, delay=1.5)
 def fetch_stock_notices(symbol: str, count: int = 5) -> list[dict]:
     """Fetch recent company announcements via stock_notice_report."""
     try:
@@ -69,6 +71,7 @@ def fetch_stock_notices(symbol: str, count: int = 5) -> list[dict]:
         return []
 
 
+@retry(max_attempts=3, delay=1.5)
 def fetch_institute_recommendations(symbol: str, count: int = 5) -> list[dict]:
     """Fetch recent analyst ratings/research reports."""
     try:

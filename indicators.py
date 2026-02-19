@@ -23,12 +23,32 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 def configure_stdio() -> None:
-    """Configure stdout/stderr for UTF-8 encoding (works on both Windows and Linux)."""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
-        except Exception:
-            continue
+    """Configure stdout/stderr for UTF-8 encoding."""
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
+
+def retry(max_attempts: int = 3, delay: float = 1.0):
+    """Simple retry decorator for network-bound operations."""
+    import time
+    from functools import wraps
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_err = None
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_err = e
+                    if attempt < max_attempts - 1:
+                        time.sleep(delay * (attempt + 1))
+            raise last_err
+        return wrapper
+    return decorator
 
 
 def emit_event(event: str, **data):
@@ -191,6 +211,7 @@ def check_pullback_to_ma(close: pd.Series, ma: pd.Series,
     Check if price pulled back to MA support - better entry timing than chasing.
     Returns True if price is within 'tolerance' above the MA.
     """
+    import pandas as pd
     if len(close) < 3 or len(ma) < 3:
         return False
     price = close.iloc[-1]
@@ -201,3 +222,72 @@ def check_pullback_to_ma(close: pd.Series, ma: pd.Series,
     # Price is slightly above MA (0% to +tolerance), and was higher before
     was_higher = any(close.iloc[-5:-1] > ma.iloc[-5:-1] * (1 + tolerance * 2))
     return 0 <= ratio <= tolerance and was_higher
+
+
+@retry(max_attempts=3, delay=2.0)
+def check_market_regime() -> dict:
+    """
+    Check overall market regime by analyzing Shanghai Composite.
+    Returns regime info: 'bull', 'neutral', or 'bear' with confidence components.
+    """
+    import akshare as ak
+    import pandas as pd
+    import sys
+    
+    try:
+        df = ak.stock_zh_index_daily(symbol="sh000001")
+        if df is None or df.empty or len(df) < 60:
+            return {"regime": "neutral", "confidence": 0.0, "reason": "数据不足"}
+        
+        close_col = pick_col(df, ["close", "收盘"])
+        if close_col is None:
+            return {"regime": "neutral", "confidence": 0.0, "reason": "无收盘列"}
+            
+        close = df[close_col].astype(float).iloc[-120:]
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+        p = close.iloc[-1]
+        ma20_now = ma20.iloc[-1]
+        ma60_now = ma60.iloc[-1] if not pd.isna(ma60.iloc[-1]) else None
+
+        ma20_slope = (ma20.iloc[-1] - ma20.iloc[-6]) / ma20.iloc[-6] if not pd.isna(ma20.iloc[-6]) and ma20.iloc[-6] > 0 else 0
+
+        score = 0.0
+        reasons = []
+        if p > ma20_now:
+            score += 1
+            reasons.append("指数>MA20")
+        else:
+            score -= 1
+            reasons.append("指数<MA20")
+            
+        if ma60_now and p > ma60_now:
+            score += 1
+            reasons.append("指数>MA60")
+        elif ma60_now:
+            score -= 1
+            reasons.append("指数<MA60")
+            
+        if ma20_slope > 0.005:
+            score += 1
+            reasons.append("MA20上升")
+        elif ma20_slope < -0.005:
+            score -= 1
+            reasons.append("MA20下降")
+
+        if score >= 2:
+            regime = "bull"
+        elif score <= -2:
+            regime = "bear"
+        else:
+            regime = "neutral"
+            
+        return {
+            "regime": regime, 
+            "confidence": abs(score) / 3.0,
+            "reason": "; ".join(reasons), 
+            "score": score
+        }
+    except Exception as e:
+        print(f"  [WARN] 大盘环境检测失败: {e}", file=sys.stderr)
+        return {"regime": "neutral", "confidence": 0.0, "reason": f"检测异常: {e}"}
