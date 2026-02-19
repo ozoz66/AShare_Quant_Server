@@ -52,6 +52,7 @@ def cmd_scan(args):
         output_dir=args.output_dir,
         output_json=args.json,
         weights=weights if weights else None,
+        weight_preset=args.weight_preset,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -85,6 +86,8 @@ def main():
     p_scan.add_argument("--pool", type=str, default="tech_stock_pool.json", help="Stock pool JSON path")
     p_scan.add_argument("--output-dir", type=str, default="output", help="Output directory")
     p_scan.add_argument("--json", action="store_true", help="Output JSON format")
+    p_scan.add_argument("--weight-preset", type=str, default="balanced", choices=["balanced", "momentum", "value", "trend"],
+                        help="Scoring preset inspired by mature quant frameworks")
     # Custom scoring weights
     p_scan.add_argument("--trend-weight", type=float, default=None, help="Trend factor weight (default: 0.30)")
     p_scan.add_argument("--momentum-weight", type=float, default=None, help="Momentum factor weight (default: 0.25)")

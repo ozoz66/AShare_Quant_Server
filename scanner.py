@@ -571,22 +571,53 @@ def _valuation_pb_score(pb: float | None) -> float:
         return max(0.5, 5.0 - (pb - optimal) ** 1.1 * 0.6)
 
 
-def composite_score(tech: dict, pe: float, pb: float,
-                    sentiment_score: float = 5.0) -> float:
-    """
-    Compute final composite score:
-      Technical (max 75) + Valuation (max 15) + Sentiment (max 10) = 100
+def calculate_score_breakdown(
+    tech: dict,
+    pe: float,
+    pb: float,
+    sentiment_score: float = 5.0,
+    weights: dict | None = None,
+) -> dict:
+    """Calculate raw factor scores and weighted contribution points (0-100)."""
+    factor_weights = normalize_weights(weights)
 
-    Uses continuous valuation scoring for better differentiation.
-    """
-    tech_total = tech["tech_total"]
+    trend_score = max(0.0, min(30.0, float(tech.get("trend_score", 0.0))))
+    momentum_score = max(0.0, min(25.0, float(tech.get("momentum_score", 0.0))))
+    volume_score = max(0.0, min(20.0, float(tech.get("volume_score", 0.0))))
 
-    val_score = _valuation_pe_score(pe) + _valuation_pb_score(pb)
-    val_score = min(15.0, val_score)
-
+    val_score = min(15.0, _valuation_pe_score(pe) + _valuation_pb_score(pb))
     sent_score = max(0.0, min(10.0, float(sentiment_score)))
 
-    return round(tech_total + val_score + sent_score, 2)
+    weighted = {
+        "trend": round((trend_score / 30.0) * factor_weights["trend"] * 100, 2),
+        "momentum": round((momentum_score / 25.0) * factor_weights["momentum"] * 100, 2),
+        "volume": round((volume_score / 20.0) * factor_weights["volume"] * 100, 2),
+        "valuation": round((val_score / 15.0) * factor_weights["valuation"] * 100, 2),
+        "sentiment": round((sent_score / 10.0) * factor_weights["sentiment"] * 100, 2),
+    }
+
+    return {
+        "raw": {
+            "trend": round(trend_score, 2),
+            "momentum": round(momentum_score, 2),
+            "volume": round(volume_score, 2),
+            "valuation": round(val_score, 2),
+            "sentiment": round(sent_score, 2),
+        },
+        "weighted": weighted,
+        "total": round(sum(weighted.values()), 2),
+    }
+
+
+def composite_score(tech: dict, pe: float, pb: float,
+                    sentiment_score: float = 5.0, weights: dict | None = None) -> float:
+    """
+    Compute final composite score with configurable factor weights.
+    """
+    breakdown = calculate_score_breakdown(
+        tech=tech, pe=pe, pb=pb, sentiment_score=sentiment_score, weights=weights
+    )
+    return breakdown["total"]
 
 
 def score_to_rating(score: float) -> str:
@@ -668,6 +699,12 @@ def build_txt_report(
             f"量能:{stock['volume_score']}  估值:{stock['val_score']}  "
             f"消息面:{sent_label}({sent_score}/10)"
         )
+        weighted = stock.get("score_breakdown", {}).get("weighted", {})
+        if weighted:
+            lines.append(
+                f"     加权贡献: 趋势{weighted.get('trend', 0)} / 动量{weighted.get('momentum', 0)} / "
+                f"量能{weighted.get('volume', 0)} / 估值{weighted.get('valuation', 0)} / 消息面{weighted.get('sentiment', 0)}"
+            )
         lines.append(
             f"     RSI(6/12/24): {stock['rsi6']}/{stock['rsi12']}/{stock['rsi24']}  "
             f"MACD: {stock['macd']}  量比: {stock.get('vol_ratio', 'N/A')}"
@@ -738,6 +775,7 @@ def build_json_report(
                 "volume": stock["volume_score"],
                 "valuation": stock["val_score"],
             },
+            "score_breakdown": stock.get("score_breakdown", {}),
             "rsi": {"rsi6": stock["rsi6"], "rsi12": stock["rsi12"], "rsi24": stock["rsi24"]},
             "macd": stock["macd"],
             "vol_ratio": stock.get("vol_ratio"),
@@ -788,9 +826,32 @@ DEFAULT_WEIGHTS = {
     "sentiment": 0.10,  # 10 points max
 }
 
+WEIGHT_PRESETS = {
+    "balanced": DEFAULT_WEIGHTS,
+    "momentum": {"trend": 0.20, "momentum": 0.40, "volume": 0.20, "valuation": 0.10, "sentiment": 0.10},
+    "value": {"trend": 0.20, "momentum": 0.15, "volume": 0.10, "valuation": 0.40, "sentiment": 0.15},
+    "trend": {"trend": 0.45, "momentum": 0.20, "volume": 0.20, "valuation": 0.10, "sentiment": 0.05},
+}
+
+
+def normalize_weights(weights: dict | None = None) -> dict:
+    merged = DEFAULT_WEIGHTS.copy()
+    if weights:
+        merged.update(weights)
+
+    for factor, value in merged.items():
+        if value is None or value < 0:
+            raise ValueError(f"权重必须为非负数: {factor}={value}")
+
+    total = sum(merged.values())
+    if total <= 0:
+        raise ValueError("权重总和必须大于0")
+
+    return {k: v / total for k, v in merged.items()}
+
 def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
                 output_dir: str = "output", output_json: bool = False,
-                weights: dict = None) -> dict | str:
+                weights: dict = None, weight_preset: str = "balanced") -> dict | str:
     """
     Core scanner logic. Returns JSON dict if output_json=True, else text report string.
     Can be called programmatically or from CLI.
@@ -803,11 +864,13 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
         weights: Optional dict with custom weights for scoring factors.
                  Keys: trend, momentum, volume, valuation, sentiment
                  Values: float (e.g., 0.3 for 30%)
+        weight_preset: Weight preset name (balanced/momentum/value/trend)
     """
-    # Merge custom weights with defaults
-    scoring_weights = DEFAULT_WEIGHTS.copy()
+    preset_weights = WEIGHT_PRESETS.get(weight_preset, WEIGHT_PRESETS["balanced"])
+    scoring_weights = preset_weights.copy()
     if weights:
         scoring_weights.update(weights)
+    scoring_weights = normalize_weights(scoring_weights)
     
     pool = Path(pool_path)
     if not pool.is_absolute():
@@ -844,7 +907,10 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
 
     if fundamentals.empty:
         if output_json:
-            return build_json_report([], top_n, total_scanned, 0, 0, market_info=market_info)
+            result = build_json_report([], top_n, total_scanned, 0, 0, market_info=market_info)
+            result["scoring_weights"] = scoring_weights
+            result["weight_preset"] = weight_preset
+            return result
         report_text = build_txt_report([], top_n, total_scanned, 0, 0, market_info=market_info)
         save_report(report_text, Path(__file__).resolve().parent / output_dir)
         return report_text
@@ -864,8 +930,9 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
         
         pe_val = round(float(row["pe"]), 2)
         pb_val = round(float(row["pb"]), 2)
-        total_score = composite_score(tech, pe_val, pb_val)
-        val_score = round(total_score - tech["tech_total"], 1)
+        score_breakdown = calculate_score_breakdown(tech, pe_val, pb_val, weights=scoring_weights)
+        total_score = score_breakdown["total"]
+        val_score = round(score_breakdown["raw"]["valuation"], 1)
 
         if regime == "bear" and total_score < 55:
             return None
@@ -889,6 +956,7 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
             "volume_score": tech["volume_score"],
             "val_score": val_score,
             "composite_score": total_score,
+            "score_breakdown": score_breakdown,
             "signal_tags": tech["signal_tags"],
             "stop_loss": tech.get("stop_loss"),
             "risk_reward": tech.get("risk_reward"),
@@ -972,14 +1040,16 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
         stock["sentiment"] = sentiment
         sent_score = sentiment.get("raw_score", sentiment.get("score", 5))
         tech_data = {
+            "trend_score": stock["trend_score"],
+            "momentum_score": stock["momentum_score"],
+            "volume_score": stock["volume_score"],
             "tech_total": stock["trend_score"] + stock["momentum_score"] + stock["volume_score"],
         }
-        stock["composite_score"] = composite_score(
-            tech_data, stock["pe"], stock["pb"], sentiment_score=sent_score
+        stock["score_breakdown"] = calculate_score_breakdown(
+            tech_data, stock["pe"], stock["pb"], sentiment_score=sent_score, weights=scoring_weights
         )
-        stock["val_score"] = round(
-            stock["composite_score"] - tech_data["tech_total"] - max(0.0, min(10.0, sent_score)), 2
-        )
+        stock["composite_score"] = stock["score_breakdown"]["total"]
+        stock["val_score"] = stock["score_breakdown"]["raw"]["valuation"]
 
     for stock in candidates[n_candidates:]:
         stock["sentiment"] = default_sentiment()
@@ -1006,6 +1076,8 @@ def run_scanner(top_n: int = 15, pool_path: str = "tech_stock_pool.json",
             after_technical=after_technical,
             market_info=market_info,
         )
+        result["scoring_weights"] = scoring_weights
+        result["weight_preset"] = weight_preset
         # Also save text report
         report_text = build_txt_report(
             candidates=candidates,
@@ -1036,6 +1108,8 @@ def main():
     parser.add_argument("--pool", type=str, default="tech_stock_pool.json", help="股票池JSON文件路径")
     parser.add_argument("--output-dir", type=str, default="output", help="输出目录（默认: output）")
     parser.add_argument("--json", action="store_true", help="输出JSON格式（供OpenClaw等程序解析）")
+    parser.add_argument("--weight-preset", type=str, default="balanced", choices=["balanced", "momentum", "value", "trend"],
+                        help="权重预设：balanced/momentum/value/trend")
     args = parser.parse_args()
 
     result = run_scanner(
@@ -1043,6 +1117,7 @@ def main():
         pool_path=args.pool,
         output_dir=args.output_dir,
         output_json=args.json,
+        weight_preset=args.weight_preset,
     )
 
     if args.json:
