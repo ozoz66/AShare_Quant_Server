@@ -61,6 +61,9 @@ python main.py scan --top 10 --json
 # Batch screening with custom weights
 python main.py scan --top 10 --trend-weight 0.4 --momentum-weight 0.2 --volume-weight 0.2
 
+# Use ready-made strategy profiles (inspired by mature quant projects)
+python main.py scan --top 10 --weight-preset momentum
+
 # Using different stock pools
 python main.py scan --top 10 --pool blue_chip_pool.json
 
@@ -77,6 +80,9 @@ python main.py analyze --symbol 贵州茅台 --json
 | `--volume-weight` | 0.20 | Volume factor weight (20%) |
 | `--valuation-weight` | 0.15 | Valuation factor weight (15%) |
 | `--sentiment-weight` | 0.10 | Sentiment factor weight (10%) |
+| `--weight-preset` | balanced | Built-in profile (参考 Qlib/Freqtrade 常见风格): `balanced`, `momentum`, `value`, `trend` |
+
+> Note: factor weights are now normalized and truly applied to final ranking scores.
 
 **Stock Pools:**
 - `tech_stock_pool.json` - Default (~120 tech/stock pool)
@@ -108,7 +114,7 @@ AShare_Quant_Server/
 
 When using `--json`, each command returns a structured JSON object:
 
-**scan**: `{ report_type, generated_at, market_regime, statistics, recommendations[], disclaimer }`
+**scan**: `{ report_type, generated_at, market_regime, statistics, recommendations[], scoring_weights, weight_preset, disclaimer }`
 
 **analyze**: `{ report_type, generated_at, stock, market_regime, quote, fundamentals, technicals, news, sentiment, trade_advice, disclaimer }`
 
@@ -187,6 +193,9 @@ python main.py scan --top 10 --json
 # 自定义权重选股
 python main.py scan --top 10 --trend-weight 0.4 --momentum-weight 0.2 --volume-weight 0.2
 
+# 使用成熟量化项目常见的预设权重风格
+python main.py scan --top 10 --weight-preset momentum
+
 # 使用不同股票池
 python main.py scan --top 10 --pool blue_chip_pool.json
 
@@ -203,6 +212,9 @@ python main.py analyze --symbol 贵州茅台 --json
 | `--volume-weight` | 0.20 | 量能因子权重 (20%) |
 | `--valuation-weight` | 0.15 | 估值因子权重 (15%) |
 | `--sentiment-weight` | 0.10 | 消息面因子权重 (10%) |
+| `--weight-preset` | balanced | 内置预设（参考 Qlib/Freqtrade 常见风格）：`balanced`、`momentum`、`value`、`trend` |
+
+> 说明：各因子权重会先归一化再参与最终评分，确保自定义权重真实生效。
 
 **股票池：**
 - `tech_stock_pool.json` - 默认股票池（约120只）
@@ -234,7 +246,7 @@ AShare_Quant_Server/
 
 使用 `--json` 时，各命令返回结构化 JSON：
 
-**scan**: `{ report_type, generated_at, market_regime, statistics, recommendations[], disclaimer }`
+**scan**: `{ report_type, generated_at, market_regime, statistics, recommendations[], scoring_weights, weight_preset, disclaimer }`
 
 **analyze**: `{ report_type, generated_at, stock, market_regime, quote, fundamentals, technicals, news, sentiment, trade_advice, disclaimer }`
 
